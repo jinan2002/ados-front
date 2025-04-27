@@ -1,60 +1,148 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>Predict from Movement Data</title>
+  <title>Predict from JSON Movement Data</title>
 </head>
 <body>
-  <h2>ADOS Prediction</h2>
+  <h2>ADOS Prediction from JSON File</h2>
   
-  <label for="sequenceInput">Enter sequence (one row per line, comma-separated):</label><br>
-  <textarea id="sequenceInput" rows="10" cols="50">
-0.5,0.7,0.3
-0.6,0.8,0.4
-0.7,0.9,0.2
-  </textarea><br><br>
+  <label for="fileInput">Upload JSON File:</label><br>
+  <input type="file" id="fileInput" accept=".json"><br><br>
 
-  <button onclick="sendPrediction()">Predict</button>
+  <button onclick="preprocessAndSend()">Predict</button>
 
   <h3>Result:</h3>
   <pre id="result"></pre>
 
   <script>
-    function sendPrediction() {
-      const rawInput = document.getElementById('sequenceInput').value.trim();
+    function preprocessAndSend() {
+      const fileInput = document.getElementById('fileInput');
+      const file = fileInput.files[0];
 
-      if (!rawInput) {
-        document.getElementById('result').textContent = 'Please enter sequence data first.';
+      if (!file) {
+        document.getElementById('result').textContent = 'Please upload a JSON file first.';
         return;
       }
 
-      const sequence = rawInput.split('\n').map(row =>
-        row.split(',').map(val => parseFloat(val))
-      );
+      const reader = new FileReader();
+      reader.onload = function(event) {
+        try {
+          const jsonData = JSON.parse(event.target.result);
 
-      console.log('Sending sequence:', sequence);  // Debug print in console
+          // Step 1: extract "eye_gaze.rx" array
+          let sequence = jsonData.eye_gaze.rx;
 
-      fetch('https://ados-api.onrender.com/predict', {
+          if (!Array.isArray(sequence)) {
+            throw new Error("Invalid format: Missing eye_gaze.rx array.");
+          }
 
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ sequence: sequence })
-      })
-      .then(async response => {
-        if (!response.ok) {
-          const err = await response.text();
-          throw new Error(err || 'Unknown error');
+          // Step 2: Remove leading nulls
+          while (sequence.length > 0 && sequence[0] === null) {
+            sequence.shift();
+          }
+
+          // Step 3: Remove trailing nulls
+          while (sequence.length > 0 && sequence[sequence.length - 1] === null) {
+            sequence.pop();
+          }
+
+          // Step 4: Interpolation for inner nulls
+          for (let i = 0; i < sequence.length; i++) {
+            if (sequence[i] === null) {
+              let prev = i - 1;
+              let next = i + 1;
+
+              // Find previous non-null
+              while (prev >= 0 && sequence[prev] === null) {
+                prev--;
+              }
+
+              // Find next non-null
+              while (next < sequence.length && sequence[next] === null) {
+                next++;
+              }
+
+              if (prev >= 0 && next < sequence.length) {
+                sequence[i] = (sequence[prev] + sequence[next]) / 2;
+              } else if (prev >= 0) {
+                sequence[i] = sequence[prev];
+              } else if (next < sequence.length) {
+                sequence[i] = sequence[next];
+              } else {
+                sequence[i] = 0;
+              }
+            }
+          }
+
+          // Step 5: معالجة أعمدة confidence (ملء القيم الناقصة بالوضع Mode)
+          const allColumns = Object.keys(jsonData.eye_gaze);
+          const confidenceColumns = allColumns.filter(col => col.includes("confidence"));
+
+          confidenceColumns.forEach(col => {
+            let columnData = jsonData.eye_gaze[col];
+            if (!Array.isArray(columnData)) return;
+
+            const nonNullValues = columnData.filter(v => v !== null);
+            if (nonNullValues.length > 0) {
+              const modeMap = {};
+              nonNullValues.forEach(v => {
+                modeMap[v] = (modeMap[v] || 0) + 1;
+              });
+              const modeValue = Object.keys(modeMap).reduce((a, b) => modeMap[a] > modeMap[b] ? a : b);
+
+              for (let i = 0; i < columnData.length; i++) {
+                if (columnData[i] === null) {
+                  columnData[i] = parseFloat(modeValue);
+                }
+              }
+            } else {
+              for (let i = 0; i < columnData.length; i++) {
+                if (columnData[i] === null) {
+                  columnData[i] = 0;
+                }
+              }
+            }
+          });
+
+          // Step 6: Normalization
+          const min = Math.min(...sequence);
+          const max = Math.max(...sequence);
+          const normalizedSequence = sequence.map(val => (val - min) / (max - min));
+
+          // Step 7: تجهيز الشكل النهائي المطلوب للإرسال
+          const formattedSequence = normalizedSequence.map(value => [value]);
+
+          console.log('Sending preprocessed sequence:', formattedSequence);
+
+          fetch('https://ados-api.onrender.com/predict', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ sequence: formattedSequence })
+          })
+          .then(async response => {
+            if (!response.ok) {
+              const err = await response.text();
+              throw new Error(err || 'Unknown error');
+            }
+            return response.json();
+          })
+          .then(data => {
+            document.getElementById('result').textContent = JSON.stringify(data, null, 2);
+          })
+          .catch(error => {
+            console.error('Error from API:', error);
+            document.getElementById('result').textContent = '❌ Error:\n' + error;
+          });
+
+        } catch (error) {
+          console.error('❌ Invalid JSON or processing error:', error);
+          document.getElementById('result').textContent = '❌ Invalid JSON or processing error: ' + error;
         }
-        return response.json();
-      })
-      .then(data => {
-        document.getElementById('result').textContent = JSON.stringify(data, null, 2);
-      })
-      .catch(error => {
-        console.error('Error from API:', error);
-        document.getElementById('result').textContent = '❌ Error:\n' + error;
-      });
+      };
+
+      reader.readAsText(file);
     }
   </script>
 </body>
